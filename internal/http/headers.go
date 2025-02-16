@@ -170,12 +170,20 @@ const (
 	MinIOServerStatus = "x-minio-server-status"
 
 	// Content Checksums
-	AmzChecksumAlgo   = "x-amz-checksum-algorithm"
-	AmzChecksumCRC32  = "x-amz-checksum-crc32"
-	AmzChecksumCRC32C = "x-amz-checksum-crc32c"
-	AmzChecksumSHA1   = "x-amz-checksum-sha1"
-	AmzChecksumSHA256 = "x-amz-checksum-sha256"
-	AmzChecksumMode   = "x-amz-checksum-mode"
+	AmzChecksumAlgo           = "x-amz-checksum-algorithm"
+	AmzChecksumCRC32          = "x-amz-checksum-crc32"
+	AmzChecksumCRC32C         = "x-amz-checksum-crc32c"
+	AmzChecksumSHA1           = "x-amz-checksum-sha1"
+	AmzChecksumSHA256         = "x-amz-checksum-sha256"
+	AmzChecksumCRC64NVME      = "x-amz-checksum-crc64nvme"
+	AmzChecksumMode           = "x-amz-checksum-mode"
+	AmzChecksumType           = "x-amz-checksum-type"
+	AmzChecksumTypeFullObject = "FULL_OBJECT"
+	AmzChecksumTypeComposite  = "COMPOSITE"
+
+	// Post Policy related
+	AmzMetaUUID = "X-Amz-Meta-Uuid"
+	AmzMetaName = "X-Amz-Meta-Name"
 
 	// Delete special flag to force delete a bucket or a prefix
 	MinIOForceDelete = "x-minio-force-delete"
@@ -233,6 +241,9 @@ const (
 	// Header indicates a Tag operation was performed on one/more peers successfully, though the
 	// current cluster does not have the object yet. This is in a site/bucket replication scenario.
 	MinIOTaggingProxied = "X-Minio-Tagging-Proxied"
+	// Header indicates the actual replicated object size
+	// In case of SSEC objects getting replicated (multipart) actual size would be needed at target
+	MinIOReplicationActualObjectSize = "X-Minio-Replication-Actual-Object-Size"
 
 	// predicted date/time of transition
 	MinIOTransition            = "X-Minio-Transition"
@@ -256,5 +267,6 @@ const (
 // http headers sent to webhook targets
 const (
 	// Reports the version of MinIO server
-	MinIOVersion = "x-minio-version"
+	MinIOVersion             = "x-minio-version"
+	WebhookEventPayloadCount = "x-minio-webhook-payload-count"
 )

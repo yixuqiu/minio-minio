@@ -22,17 +22,17 @@ import (
 	"net"
 	"net/http"
 	"path"
-	"path/filepath"
 	"runtime/debug"
 	"strings"
 	"sync/atomic"
 	"time"
+	"unicode"
 
 	"github.com/dustin/go-humanize"
 	"github.com/minio/minio-go/v7/pkg/s3utils"
 	"github.com/minio/minio-go/v7/pkg/set"
 	"github.com/minio/minio/internal/grid"
-	xnet "github.com/minio/pkg/v2/net"
+	xnet "github.com/minio/pkg/v3/net"
 
 	"github.com/minio/minio/internal/amztime"
 	"github.com/minio/minio/internal/config/dns"
@@ -73,6 +73,9 @@ const (
 // and must not set by clients
 func containsReservedMetadata(header http.Header) bool {
 	for key := range header {
+		if _, ok := validSSEReplicationHeaders[key]; ok {
+			return false
+		}
 		if stringsHasPrefixFold(key, ReservedMetadataPrefix) {
 			return true
 		}
@@ -233,7 +236,8 @@ func guessIsMetricsReq(req *http.Request) bool {
 		req.URL.Path == minioReservedBucketPath+prometheusMetricsV2ClusterPath ||
 		req.URL.Path == minioReservedBucketPath+prometheusMetricsV2NodePath ||
 		req.URL.Path == minioReservedBucketPath+prometheusMetricsV2BucketPath ||
-		req.URL.Path == minioReservedBucketPath+prometheusMetricsV2ResourcePath
+		req.URL.Path == minioReservedBucketPath+prometheusMetricsV2ResourcePath ||
+		strings.HasPrefix(req.URL.Path, minioReservedBucketPath+metricsV3Path)
 }
 
 // guessIsRPCReq - returns true if the request is for an RPC endpoint.
@@ -241,11 +245,14 @@ func guessIsRPCReq(req *http.Request) bool {
 	if req == nil {
 		return false
 	}
-	if req.Method == http.MethodGet && req.URL != nil && req.URL.Path == grid.RoutePath {
-		return true
+	if req.Method == http.MethodGet && req.URL != nil {
+		switch req.URL.Path {
+		case grid.RoutePath, grid.RouteLockPath:
+			return true
+		}
 	}
 
-	return req.Method == http.MethodPost &&
+	return (req.Method == http.MethodPost || req.Method == http.MethodGet) &&
 		strings.HasPrefix(req.URL.Path, minioReservedBucketPath+SlashSeparator)
 }
 
@@ -286,12 +293,6 @@ func parseAmzDateHeader(req *http.Request) (time.Time, APIErrorCode) {
 	return time.Time{}, ErrMissingDateHeader
 }
 
-// Bad path components to be rejected by the path validity handler.
-const (
-	dotdotComponent = ".."
-	dotComponent    = "."
-)
-
 func hasBadHost(host string) error {
 	if globalIsCICD && strings.TrimSpace(host) == "" {
 		// under CI/CD test setups ignore empty hosts as invalid hosts
@@ -304,14 +305,41 @@ func hasBadHost(host string) error {
 // Check if the incoming path has bad path components,
 // such as ".." and "."
 func hasBadPathComponent(path string) bool {
-	path = filepath.ToSlash(strings.TrimSpace(path)) // For windows '\' must be converted to '/'
-	for _, p := range strings.Split(path, SlashSeparator) {
-		switch strings.TrimSpace(p) {
-		case dotdotComponent:
+	n := len(path)
+	if n > 32<<10 {
+		// At 32K we are beyond reasonable.
+		return true
+	}
+	i := 0
+	// Skip leading slashes (for sake of Windows \ is included as well)
+	for i < n && (path[i] == SlashSeparatorChar || path[i] == '\\') {
+		i++
+	}
+
+	for i < n {
+		// Find the next segment
+		start := i
+		for i < n && path[i] != SlashSeparatorChar && path[i] != '\\' {
+			i++
+		}
+
+		// Trim whitespace of segment
+		segmentStart, segmentEnd := start, i
+		for segmentStart < segmentEnd && unicode.IsSpace(rune(path[segmentStart])) {
+			segmentStart++
+		}
+		for segmentEnd > segmentStart && unicode.IsSpace(rune(path[segmentEnd-1])) {
+			segmentEnd--
+		}
+
+		// Check for ".." or "."
+		switch {
+		case segmentEnd-segmentStart == 2 && path[segmentStart] == '.' && path[segmentStart+1] == '.':
 			return true
-		case dotComponent:
+		case segmentEnd-segmentStart == 1 && path[segmentStart] == '.':
 			return true
 		}
+		i++
 	}
 	return false
 }
@@ -456,7 +484,7 @@ func setBucketForwardingMiddleware(h http.Handler) http.Handler {
 		}
 		if globalDNSConfig == nil || !globalBucketFederation ||
 			guessIsHealthCheckReq(r) || guessIsMetricsReq(r) ||
-			guessIsRPCReq(r) || guessIsLoginSTSReq(r) || isAdminReq(r) {
+			guessIsRPCReq(r) || guessIsLoginSTSReq(r) || isAdminReq(r) || isKMSReq(r) {
 			h.ServeHTTP(w, r)
 			return
 		}
@@ -588,13 +616,6 @@ func setUploadForwardingMiddleware(h http.Handler) http.Handler {
 				h.ServeHTTP(w, r)
 				return
 			}
-			// forward request to peer handling this upload
-			if globalBucketTargetSys.isOffline(remote.EndpointURL) {
-				defer logger.AuditLog(r.Context(), w, r, mustGetClaimsFromToken(r))
-				writeErrorResponse(r.Context(), w, errorCodes.ToAPIErr(ErrReplicationRemoteConnectionError), r.URL)
-				return
-			}
-
 			r.URL.Scheme = remote.EndpointURL.Scheme
 			r.URL.Host = remote.EndpointURL.Host
 			// Make sure we remove any existing headers before

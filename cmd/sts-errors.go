@@ -40,7 +40,7 @@ func writeSTSErrorResponse(ctx context.Context, w http.ResponseWriter, errCode S
 	}
 	switch errCode {
 	case ErrSTSInternalError, ErrSTSUpstreamError:
-		logger.LogIf(ctx, err, logger.ErrorKind)
+		stsLogIf(ctx, err, logger.ErrorKind)
 	}
 	encodedErrorResponse := encodeResponse(stsErrorResponse)
 	writeResponse(w, stsErr.HTTPStatusCode, encodedErrorResponse, mimeXML)
@@ -81,6 +81,7 @@ const (
 	ErrSTSMalformedPolicyDocument
 	ErrSTSInsecureConnection
 	ErrSTSInvalidClientCertificate
+	ErrSTSTooManyIntermediateCAs
 	ErrSTSNotInitialized
 	ErrSTSIAMNotInitialized
 	ErrSTSUpstreamError
@@ -143,6 +144,11 @@ var stsErrCodes = stsErrorCodeMap{
 	ErrSTSInvalidClientCertificate: {
 		Code:           "InvalidClientCertificate",
 		Description:    "The provided client certificate is invalid. Retry with a different certificate.",
+		HTTPStatusCode: http.StatusBadRequest,
+	},
+	ErrSTSTooManyIntermediateCAs: {
+		Code:           "TooManyIntermediateCAs",
+		Description:    "The provided client certificate contains too many intermediate CA certificates",
 		HTTPStatusCode: http.StatusBadRequest,
 	},
 	ErrSTSNotInitialized: {
