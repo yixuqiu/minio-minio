@@ -27,6 +27,7 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/minio/minio/internal/bpool"
 	"github.com/tinylib/msgp/msgp"
 )
 
@@ -53,7 +54,7 @@ func (m *MSS) Get(key string) string {
 // Set a key, value pair.
 func (m *MSS) Set(key, value string) {
 	if m == nil {
-		*m = mssPool.Get().(map[string]string)
+		*m = mssPool.Get()
 	}
 	(*m)[key] = value
 }
@@ -130,7 +131,7 @@ func (m *MSS) Msgsize() int {
 
 // NewMSS returns a new MSS.
 func NewMSS() *MSS {
-	m := MSS(mssPool.Get().(map[string]string))
+	m := MSS(mssPool.Get())
 	for k := range m {
 		delete(m, k)
 	}
@@ -143,8 +144,8 @@ func NewMSSWith(m map[string]string) *MSS {
 	return &m2
 }
 
-var mssPool = sync.Pool{
-	New: func() interface{} {
+var mssPool = bpool.Pool[map[string]string]{
+	New: func() map[string]string {
 		return make(map[string]string, 5)
 	},
 }
@@ -152,7 +153,7 @@ var mssPool = sync.Pool{
 // Recycle the underlying map.
 func (m *MSS) Recycle() {
 	if m != nil && *m != nil {
-		mssPool.Put(map[string]string(*m))
+		mssPool.Put(*m)
 		*m = nil
 	}
 }
@@ -189,6 +190,12 @@ func NewBytes() *Bytes {
 	return &b
 }
 
+// NewBytesCap returns an empty Bytes with the given capacity.
+func NewBytesCap(size int) *Bytes {
+	b := Bytes(GetByteBufferCap(size))
+	return &b
+}
+
 // NewBytesWith returns a new Bytes with the provided content.
 // When sent as a parameter, the caller gives up ownership of the byte slice.
 // When returned as response, the handler also gives up ownership of the byte slice.
@@ -203,14 +210,9 @@ func NewBytesWithCopyOf(b []byte) *Bytes {
 		bb := Bytes(nil)
 		return &bb
 	}
-	if len(b) < maxBufferSize {
-		bb := NewBytes()
-		*bb = append(*bb, b...)
-		return bb
-	}
-	bb := Bytes(make([]byte, len(b)))
-	copy(bb, b)
-	return &bb
+	bb := NewBytesCap(len(b))
+	*bb = append(*bb, b...)
+	return bb
 }
 
 // Bytes provides a byte slice that can be serialized.
@@ -238,7 +240,7 @@ func (b *Bytes) UnmarshalMsg(bytes []byte) ([]byte, error) {
 		copy(*b, val)
 	} else {
 		if cap(*b) == 0 && len(val) <= maxBufferSize {
-			*b = GetByteBuffer()[:0]
+			*b = GetByteBufferCap(len(val))
 		} else {
 			PutByteBuffer(*b)
 			*b = make([]byte, 0, len(val))
@@ -278,15 +280,15 @@ func (b *Bytes) Recycle() {
 // URLValues can be used for url.Values.
 type URLValues map[string][]string
 
-var urlValuesPool = sync.Pool{
-	New: func() interface{} {
+var urlValuesPool = bpool.Pool[map[string][]string]{
+	New: func() map[string][]string {
 		return make(map[string][]string, 10)
 	},
 }
 
 // NewURLValues returns a new URLValues.
 func NewURLValues() *URLValues {
-	u := URLValues(urlValuesPool.Get().(map[string][]string))
+	u := URLValues(urlValuesPool.Get())
 	return &u
 }
 
@@ -341,7 +343,7 @@ func (u *URLValues) UnmarshalMsg(bts []byte) (o []byte, err error) {
 		return
 	}
 	if *u == nil {
-		*u = urlValuesPool.Get().(map[string][]string)
+		*u = urlValuesPool.Get()
 	}
 	if len(*u) > 0 {
 		for key := range *u {
@@ -423,9 +425,11 @@ func NewJSONPool[T any]() *JSONPool[T] {
 
 func (p *JSONPool[T]) new() *T {
 	var zero T
-	t := p.pool.Get().(*T)
-	*t = zero
-	return t
+	if t, ok := p.pool.Get().(*T); ok {
+		*t = zero
+		return t
+	}
+	return &zero
 }
 
 // JSON is a wrapper around a T object that can be serialized.
@@ -556,15 +560,15 @@ func (NoPayload) Recycle() {}
 
 // ArrayOf wraps an array of Messagepack compatible objects.
 type ArrayOf[T RoundTripper] struct {
-	aPool sync.Pool // Arrays
-	ePool sync.Pool // Elements
+	aPool sync.Pool     // Arrays
+	ePool bpool.Pool[T] // Elements
 }
 
 // NewArrayOf returns a new ArrayOf.
 // You must provide a function that returns a new instance of T.
 func NewArrayOf[T RoundTripper](newFn func() T) *ArrayOf[T] {
 	return &ArrayOf[T]{
-		ePool: sync.Pool{New: func() any {
+		ePool: bpool.Pool[T]{New: func() T {
 			return newFn()
 		}},
 	}
@@ -597,6 +601,7 @@ func (p *ArrayOf[T]) newA(sz uint32) []T {
 func (p *ArrayOf[T]) putA(v []T) {
 	var zero T // nil
 	for i, t := range v {
+		//nolint:staticcheck // SA6002 IT IS A GENERIC VALUE!
 		p.ePool.Put(t)
 		v[i] = zero
 	}
@@ -607,7 +612,7 @@ func (p *ArrayOf[T]) putA(v []T) {
 }
 
 func (p *ArrayOf[T]) newE() T {
-	return p.ePool.Get().(T)
+	return p.ePool.Get()
 }
 
 // Array provides a wrapper for an underlying array of serializable objects.

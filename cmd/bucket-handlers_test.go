@@ -32,7 +32,7 @@ import (
 
 // Wrapper for calling RemoveBucket HTTP handler tests for both Erasure multiple disks and single node setup.
 func TestRemoveBucketHandler(t *testing.T) {
-	ExecObjectLayerAPITest(t, testRemoveBucketHandler, []string{"RemoveBucket"})
+	ExecObjectLayerAPITest(ExecObjectLayerAPITestArgs{t: t, objAPITest: testRemoveBucketHandler, endpoints: []string{"RemoveBucket"}})
 }
 
 func testRemoveBucketHandler(obj ObjectLayer, instanceType, bucketName string, apiRouter http.Handler,
@@ -78,7 +78,7 @@ func testRemoveBucketHandler(obj ObjectLayer, instanceType, bucketName string, a
 
 // Wrapper for calling GetBucketPolicy HTTP handler tests for both Erasure multiple disks and single node setup.
 func TestGetBucketLocationHandler(t *testing.T) {
-	ExecObjectLayerAPITest(t, testGetBucketLocationHandler, []string{"GetBucketLocation"})
+	ExecObjectLayerAPITest(ExecObjectLayerAPITestArgs{t: t, objAPITest: testGetBucketLocationHandler, endpoints: []string{"GetBucketLocation"}})
 }
 
 func testGetBucketLocationHandler(obj ObjectLayer, instanceType, bucketName string, apiRouter http.Handler,
@@ -188,7 +188,6 @@ func testGetBucketLocationHandler(obj ObjectLayer, instanceType, bucketName stri
 		if errorResponse.Code != testCase.errorResponse.Code {
 			t.Errorf("Test %d: %s: Expected the error code to be `%s`, but instead found `%s`", i+1, instanceType, testCase.errorResponse.Code, errorResponse.Code)
 		}
-
 	}
 
 	// Test for Anonymous/unsigned http request.
@@ -220,7 +219,7 @@ func testGetBucketLocationHandler(obj ObjectLayer, instanceType, bucketName stri
 
 // Wrapper for calling HeadBucket HTTP handler tests for both Erasure multiple disks and single node setup.
 func TestHeadBucketHandler(t *testing.T) {
-	ExecObjectLayerAPITest(t, testHeadBucketHandler, []string{"HeadBucket"})
+	ExecObjectLayerAPITest(ExecObjectLayerAPITestArgs{t: t, objAPITest: testHeadBucketHandler, endpoints: []string{"HeadBucket"}})
 }
 
 func testHeadBucketHandler(obj ObjectLayer, instanceType, bucketName string, apiRouter http.Handler,
@@ -290,7 +289,6 @@ func testHeadBucketHandler(obj ObjectLayer, instanceType, bucketName string, api
 		if recV2.Code != testCase.expectedRespStatus {
 			t.Errorf("Test %d: %s: Expected the response status to be `%d`, but instead found `%d`", i+1, instanceType, testCase.expectedRespStatus, recV2.Code)
 		}
-
 	}
 
 	// Test for Anonymous/unsigned http request.
@@ -322,7 +320,7 @@ func testHeadBucketHandler(obj ObjectLayer, instanceType, bucketName string, api
 
 // Wrapper for calling TestListMultipartUploadsHandler tests for both Erasure multiple disks and single node setup.
 func TestListMultipartUploadsHandler(t *testing.T) {
-	ExecObjectLayerAPITest(t, testListMultipartUploadsHandler, []string{"ListMultipartUploads"})
+	ExecObjectLayerAPITest(ExecObjectLayerAPITestArgs{t: t, objAPITest: testListMultipartUploadsHandler, endpoints: []string{"ListMultipartUploads"}})
 }
 
 // testListMultipartUploadsHandler - Tests validate listing of multipart uploads.
@@ -558,7 +556,7 @@ func testListMultipartUploadsHandler(obj ObjectLayer, instanceType, bucketName s
 
 // Wrapper for calling TestListBucketsHandler tests for both Erasure multiple disks and single node setup.
 func TestListBucketsHandler(t *testing.T) {
-	ExecObjectLayerAPITest(t, testListBucketsHandler, []string{"ListBuckets"})
+	ExecObjectLayerAPITest(ExecObjectLayerAPITestArgs{t: t, objAPITest: testListBucketsHandler, endpoints: []string{"ListBuckets"}})
 }
 
 // testListBucketsHandler - Tests validate listing of buckets.
@@ -649,7 +647,7 @@ func testListBucketsHandler(obj ObjectLayer, instanceType, bucketName string, ap
 
 // Wrapper for calling DeleteMultipleObjects HTTP handler tests for both Erasure multiple disks and single node setup.
 func TestAPIDeleteMultipleObjectsHandler(t *testing.T) {
-	ExecObjectLayerAPITest(t, testAPIDeleteMultipleObjectsHandler, []string{"DeleteMultipleObjects", "PutBucketPolicy"})
+	ExecObjectLayerAPITest(ExecObjectLayerAPITestArgs{t: t, objAPITest: testAPIDeleteMultipleObjectsHandler, endpoints: []string{"DeleteMultipleObjects", "PutBucketPolicy"}})
 }
 
 func testAPIDeleteMultipleObjectsHandler(obj ObjectLayer, instanceType, bucketName string, apiRouter http.Handler,
