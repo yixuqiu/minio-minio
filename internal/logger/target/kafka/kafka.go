@@ -24,6 +24,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"sync"
@@ -37,7 +38,7 @@ import (
 	"github.com/minio/minio/internal/logger/target/types"
 	"github.com/minio/minio/internal/once"
 	"github.com/minio/minio/internal/store"
-	xnet "github.com/minio/pkg/v2/net"
+	xnet "github.com/minio/pkg/v3/net"
 )
 
 // the suffix for the configured queue dir where the logs will be persisted.
@@ -168,9 +169,8 @@ func (h *Target) Init(ctx context.Context) error {
 }
 
 func (h *Target) initQueueStore(ctx context.Context) (err error) {
-	var queueStore store.Store[interface{}]
 	queueDir := filepath.Join(h.kconfig.QueueDir, h.Name())
-	queueStore = store.NewQueueStore[interface{}](queueDir, uint64(h.kconfig.QueueSize), kafkaLoggerExtension)
+	queueStore := store.NewQueueStore[interface{}](queueDir, uint64(h.kconfig.QueueSize), kafkaLoggerExtension)
 	if err = queueStore.Open(); err != nil {
 		return fmt.Errorf("unable to initialize the queue store of %s webhook: %w", h.Name(), err)
 	}
@@ -188,7 +188,6 @@ func (h *Target) startKafkaLogger() {
 		// We are not allowed to add when logCh is nil
 		h.wg.Add(1)
 		defer h.wg.Done()
-
 	}
 	h.logChMu.RUnlock()
 
@@ -234,6 +233,10 @@ func (h *Target) send(entry interface{}) error {
 
 // Init initialize kafka target
 func (h *Target) init() error {
+	if os.Getenv("_MINIO_KAFKA_DEBUG") != "" {
+		sarama.DebugLogger = log.Default()
+	}
+
 	sconfig := sarama.NewConfig()
 	if h.kconfig.Version != "" {
 		kafkaVersion, err := sarama.ParseKafkaVersion(h.kconfig.Version)
@@ -311,7 +314,8 @@ func (h *Target) IsOnline(_ context.Context) bool {
 func (h *Target) Send(ctx context.Context, entry interface{}) error {
 	if h.store != nil {
 		// save the entry to the queue store which will be replayed to the target.
-		return h.store.Put(entry)
+		_, err := h.store.Put(entry)
+		return err
 	}
 	h.logChMu.RLock()
 	defer h.logChMu.RUnlock()
@@ -340,7 +344,7 @@ func (h *Target) Send(ctx context.Context, entry interface{}) error {
 
 // SendFromStore - reads the log from store and sends it to kafka.
 func (h *Target) SendFromStore(key store.Key) (err error) {
-	auditEntry, err := h.store.Get(key.Name)
+	auditEntry, err := h.store.Get(key)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil
@@ -354,7 +358,7 @@ func (h *Target) SendFromStore(key store.Key) (err error) {
 		return
 	}
 	// Delete the event from store.
-	return h.store.Del(key.Name)
+	return h.store.Del(key)
 }
 
 // Cancel - cancels the target

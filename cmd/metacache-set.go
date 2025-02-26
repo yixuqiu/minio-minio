@@ -29,6 +29,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	jsoniter "github.com/json-iterator/go"
@@ -38,8 +39,7 @@ import (
 	"github.com/minio/minio/internal/color"
 	"github.com/minio/minio/internal/hash"
 	xioutil "github.com/minio/minio/internal/ioutil"
-	"github.com/minio/minio/internal/logger"
-	"github.com/minio/pkg/v2/console"
+	"github.com/minio/pkg/v3/console"
 )
 
 //go:generate msgp -file $GOFILE -unexported
@@ -98,6 +98,8 @@ type listPathOptions struct {
 
 	// Versioned is this a ListObjectVersions call.
 	Versioned bool
+	// V1 listing type
+	V1 bool
 
 	// Versioning config is used for if the path
 	// has versioning enabled.
@@ -172,7 +174,8 @@ func (o *listPathOptions) debugln(data ...interface{}) {
 	}
 }
 
-// gatherResults will collect all results on the input channel and filter results according to the options.
+// gatherResults will collect all results on the input channel and filter results according
+// to the options or to the current bucket ILM expiry rules.
 // Caller should close the channel when done.
 // The returned function will return the results once there is enough or input is closed,
 // or the context is canceled.
@@ -180,8 +183,7 @@ func (o *listPathOptions) gatherResults(ctx context.Context, in <-chan metaCache
 	resultsDone := make(chan metaCacheEntriesSorted)
 	// Copy so we can mutate
 	resCh := resultsDone
-	var done bool
-	var mu sync.Mutex
+	var done atomic.Bool
 	resErr := io.EOF
 
 	go func() {
@@ -192,9 +194,7 @@ func (o *listPathOptions) gatherResults(ctx context.Context, in <-chan metaCache
 				// past limit
 				continue
 			}
-			mu.Lock()
-			returned = done
-			mu.Unlock()
+			returned = done.Load()
 			if returned {
 				resCh = nil
 				continue
@@ -213,6 +213,12 @@ func (o *listPathOptions) gatherResults(ctx context.Context, in <-chan metaCache
 			}
 			if !o.InclDeleted && entry.isObject() && entry.isLatestDeletemarker() && !entry.isObjectDir() {
 				continue
+			}
+			if o.Lifecycle != nil || o.Replication.Config != nil {
+				if skipped := triggerExpiryAndRepl(ctx, *o, entry); skipped == true {
+					results.lastSkippedEntry = entry.name
+					continue
+				}
 			}
 			if o.Limit > 0 && results.len() >= o.Limit {
 				// We have enough and we have more.
@@ -242,9 +248,7 @@ func (o *listPathOptions) gatherResults(ctx context.Context, in <-chan metaCache
 	return func() (metaCacheEntriesSorted, error) {
 		select {
 		case <-ctx.Done():
-			mu.Lock()
-			done = true
-			mu.Unlock()
+			done.Store(true)
 			return metaCacheEntriesSorted{}, ctx.Err()
 		case r := <-resultsDone:
 			return r, resErr
@@ -276,7 +280,7 @@ func (o *listPathOptions) findFirstPart(fi FileInfo) (int, error) {
 		}
 		err := json.Unmarshal([]byte(v), &tmp)
 		if !ok {
-			logger.LogIf(context.Background(), err)
+			bugLogIf(context.Background(), err)
 			return -1, err
 		}
 		if tmp.First == "" && tmp.Last == "" && tmp.EOS {
@@ -383,7 +387,7 @@ func (r *metacacheReader) filter(o listPathOptions) (entries metaCacheEntriesSor
 			if !o.InclDeleted && entry.isObject() && entry.isLatestDeletemarker() && !entry.isObjectDir() {
 				return true
 			}
-			if entry.isAllFreeVersions() {
+			if !o.InclDeleted && entry.isAllFreeVersions() {
 				return true
 			}
 			entries.o = append(entries.o, entry)
@@ -529,7 +533,7 @@ func (er *erasureObjects) streamMetadataParts(ctx context.Context, o listPathOpt
 				}
 				loadedPart = partN
 				bi, err := getMetacacheBlockInfo(fi, partN)
-				logger.LogIf(ctx, err)
+				internalLogIf(ctx, err)
 				if err == nil {
 					if bi.pastPrefix(o.Prefix) {
 						return entries, io.EOF
@@ -565,10 +569,11 @@ func (er *erasureObjects) streamMetadataParts(ctx context.Context, o listPathOpt
 					continue
 				case InsufficientReadQuorum:
 					retries++
+					loadedPart = -1
 					time.Sleep(retryDelay250)
 					continue
 				default:
-					logger.LogIf(ctx, err)
+					internalLogIf(ctx, err)
 					return entries, err
 				}
 			}
@@ -576,7 +581,7 @@ func (er *erasureObjects) streamMetadataParts(ctx context.Context, o listPathOpt
 			// We finished at the end of the block.
 			// And should not expect any more results.
 			bi, err := getMetacacheBlockInfo(fi, partN)
-			logger.LogIf(ctx, err)
+			internalLogIf(ctx, err)
 			if err != nil || bi.EOS {
 				// We are done and there are no more parts.
 				return entries, io.EOF
@@ -617,18 +622,18 @@ func calcCommonWritesDeletes(infos []DiskInfo, readQuorum int) (commonWrite, com
 	}
 
 	filter := func(list []uint64) (commonCount uint64) {
-		max := 0
+		maxCnt := 0
 		signatureMap := map[uint64]int{}
 		for _, v := range list {
 			signatureMap[v]++
 		}
 		for ops, count := range signatureMap {
-			if max < count && commonCount < ops {
-				max = count
+			if maxCnt < count && commonCount < ops {
+				maxCnt = count
 				commonCount = ops
 			}
 		}
-		if max < readQuorum {
+		if maxCnt < readQuorum {
 			return 0
 		}
 		return commonCount
@@ -641,7 +646,7 @@ func calcCommonWritesDeletes(infos []DiskInfo, readQuorum int) (commonWrite, com
 
 func calcCommonCounter(infos []DiskInfo, readQuorum int) (commonCount uint64) {
 	filter := func() (commonCount uint64) {
-		max := 0
+		maxCnt := 0
 		signatureMap := map[uint64]int{}
 		for _, info := range infos {
 			if info.Error != "" {
@@ -651,12 +656,12 @@ func calcCommonCounter(infos []DiskInfo, readQuorum int) (commonCount uint64) {
 			signatureMap[mutations]++
 		}
 		for ops, count := range signatureMap {
-			if max < count && commonCount < ops {
-				max = count
+			if maxCnt < count && commonCount < ops {
+				maxCnt = count
 				commonCount = ops
 			}
 		}
-		if max < readQuorum {
+		if maxCnt < readQuorum {
 			return 0
 		}
 		return commonCount
@@ -796,6 +801,17 @@ func (m *metaCacheRPC) setErr(err string) {
 	*m.meta = meta
 }
 
+// getErr will return an error if the listing failed.
+// The error is not type safe.
+func (m *metaCacheRPC) getErr() error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.meta.status == scanStateError {
+		return errors.New(m.meta.error)
+	}
+	return nil
+}
+
 func (er *erasureObjects) saveMetaCacheStream(ctx context.Context, mc *metaCacheRPC, entries <-chan metaCacheEntry) (err error) {
 	o := mc.o
 	o.debugf(color.Green("saveMetaCacheStream:")+" with options: %#v", o)
@@ -859,7 +875,7 @@ func (er *erasureObjects) saveMetaCacheStream(ctx context.Context, mc *metaCache
 		}
 		o.debugln(color.Green("saveMetaCacheStream:")+" saving block", b.n, "to", o.objectPath(b.n))
 		r, err := hash.NewReader(ctx, bytes.NewReader(b.data), int64(len(b.data)), "", "", int64(len(b.data)))
-		logger.LogIf(ctx, err)
+		bugLogIf(ctx, err)
 		custom := b.headerKV()
 		_, err = er.putMetacacheObject(ctx, o.objectPath(b.n), NewPutObjReader(r), ObjectOptions{
 			UserDefined: custom,
@@ -893,7 +909,7 @@ func (er *erasureObjects) saveMetaCacheStream(ctx context.Context, mc *metaCache
 				return err
 			case InsufficientReadQuorum:
 			default:
-				logger.LogIf(ctx, err)
+				internalLogIf(ctx, err)
 			}
 			if retries >= maxTries {
 				return err
@@ -1001,8 +1017,7 @@ func listPathRaw(ctx context.Context, opts listPathRawOptions) (err error) {
 		// not a storage error.
 		return nil
 	}
-	askDisks := len(disks)
-	readers := make([]*metacacheReader, askDisks)
+	readers := make([]*metacacheReader, len(disks))
 	defer func() {
 		for _, r := range readers {
 			r.Close()
@@ -1084,17 +1099,14 @@ func listPathRaw(ctx context.Context, opts listPathRawOptions) (err error) {
 			case nil:
 			default:
 				switch err.Error() {
-				case errFileNotFound.Error(),
-					errVolumeNotFound.Error(),
-					errUnformattedDisk.Error(),
-					errDiskNotFound.Error():
+				case errFileNotFound.Error():
 					atEOF++
 					fnf++
-					// This is a special case, to handle bucket does
-					// not exist situations.
-					if errors.Is(err, errVolumeNotFound) {
-						vnf++
-					}
+					continue
+				case errVolumeNotFound.Error():
+					atEOF++
+					fnf++
+					vnf++
 					continue
 				}
 				hasErr++
@@ -1133,8 +1145,17 @@ func listPathRaw(ctx context.Context, opts listPathRawOptions) (err error) {
 			topEntries[i] = entry
 		}
 
-		// Stop if we exceed number of bad disks
-		if hasErr > len(disks)-opts.minDisks && hasErr > 0 {
+		// Since minDisks is set to quorum, we return if we have enough.
+		if vnf > 0 && vnf >= len(readers)-opts.minDisks {
+			return errVolumeNotFound
+		}
+		// Since minDisks is set to quorum, we return if we have enough.
+		if fnf > 0 && fnf >= len(readers)-opts.minDisks {
+			return errFileNotFound
+		}
+
+		// Stop if we exceed number of bad disks.
+		if hasErr > 0 && hasErr+fnf > len(disks)-opts.minDisks {
 			if opts.finished != nil {
 				opts.finished(errs)
 			}
@@ -1152,20 +1173,12 @@ func listPathRaw(ctx context.Context, opts listPathRawOptions) (err error) {
 			return errors.New(strings.Join(combinedErr, ", "))
 		}
 
-		if vnf == len(readers) {
-			return errVolumeNotFound
-		}
-
 		// Break if all at EOF or error.
 		if atEOF+hasErr == len(readers) {
 			if hasErr > 0 && opts.finished != nil {
 				opts.finished(errs)
 			}
 			break
-		}
-
-		if fnf == len(readers) {
-			return errFileNotFound
 		}
 
 		if agree == len(readers) {

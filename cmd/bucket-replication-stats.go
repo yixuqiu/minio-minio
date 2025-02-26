@@ -87,6 +87,9 @@ func (r *ReplicationStats) updateMovingAvg() {
 
 // ActiveWorkers returns worker stats
 func (r *ReplicationStats) ActiveWorkers() ActiveWorkerStat {
+	if r == nil {
+		return ActiveWorkerStat{}
+	}
 	r.wlock.RLock()
 	defer r.wlock.RUnlock()
 	w := r.workers.get()
@@ -109,7 +112,6 @@ func (r *ReplicationStats) collectWorkerMetrics(ctx context.Context) {
 			r.wlock.Lock()
 			r.workers.update()
 			r.wlock.Unlock()
-
 		}
 	}
 }
@@ -351,6 +353,9 @@ func NewReplicationStats(ctx context.Context, objectAPI ObjectLayer) *Replicatio
 }
 
 func (r *ReplicationStats) getAllLatest(bucketsUsage map[string]BucketUsageInfo) (bucketsReplicationStats map[string]BucketStats) {
+	if r == nil {
+		return nil
+	}
 	peerBucketStatsList := globalNotificationSys.GetClusterAllBucketStats(GlobalContext)
 	bucketsReplicationStats = make(map[string]BucketStats, len(bucketsUsage))
 
@@ -460,6 +465,9 @@ func (r *ReplicationStats) calculateBucketReplicationStats(bucket string, bucket
 
 // get the most current of in-memory replication stats  and data usage info from crawler.
 func (r *ReplicationStats) getLatestReplicationStats(bucket string) (s BucketStats) {
+	if r == nil {
+		return s
+	}
 	bucketStats := globalNotificationSys.GetClusterBucketStats(GlobalContext, bucket)
 	return r.calculateBucketReplicationStats(bucket, bucketStats)
 }
@@ -495,9 +503,14 @@ func (r *ReplicationStats) decQ(bucket string, sz int64, isDelMarker bool, opTyp
 
 // incProxy increments proxy metrics for proxied calls
 func (r *ReplicationStats) incProxy(bucket string, api replProxyAPI, isErr bool) {
-	r.pCache.inc(bucket, api, isErr)
+	if r != nil {
+		r.pCache.inc(bucket, api, isErr)
+	}
 }
 
 func (r *ReplicationStats) getProxyStats(bucket string) ProxyMetric {
+	if r == nil {
+		return ProxyMetric{}
+	}
 	return r.pCache.getBucketStats(bucket)
 }

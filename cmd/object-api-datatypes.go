@@ -27,7 +27,6 @@ import (
 	"github.com/minio/madmin-go/v3"
 	"github.com/minio/minio/internal/bucket/replication"
 	"github.com/minio/minio/internal/hash"
-	"github.com/minio/minio/internal/logger"
 )
 
 //go:generate msgp -file $GOFILE -io=false -tests=false -unexported=false
@@ -234,7 +233,7 @@ func (o ObjectInfo) ExpiresStr() string {
 
 // ArchiveInfo returns any saved zip archive meta information.
 // It will be decrypted if needed.
-func (o *ObjectInfo) ArchiveInfo() []byte {
+func (o *ObjectInfo) ArchiveInfo(h http.Header) []byte {
 	if len(o.UserDefined) == 0 {
 		return nil
 	}
@@ -244,9 +243,9 @@ func (o *ObjectInfo) ArchiveInfo() []byte {
 	}
 	data := []byte(z)
 	if v, ok := o.UserDefined[archiveTypeMetadataKey]; ok && v == archiveTypeEnc {
-		decrypted, err := o.metadataDecrypter()(archiveTypeEnc, data)
+		decrypted, err := o.metadataDecrypter(h)(archiveTypeEnc, data)
 		if err != nil {
-			logger.LogIf(GlobalContext, err)
+			encLogIf(GlobalContext, err)
 			return nil
 		}
 		data = decrypted
@@ -327,6 +326,7 @@ func (ri ReplicateObjectInfo) ToObjectInfo() ObjectInfo {
 		VersionPurgeStatusInternal: ri.VersionPurgeStatusInternal,
 		DeleteMarker:               true,
 		UserDefined:                map[string]string{},
+		Checksum:                   ri.Checksum,
 	}
 }
 
@@ -358,6 +358,7 @@ type ReplicateObjectInfo struct {
 	TargetStatuses       map[string]replication.StatusType
 	TargetPurgeStatuses  map[string]VersionPurgeStatusType
 	ReplicationTimestamp time.Time
+	Checksum             []byte
 }
 
 // MultipartInfo captures metadata information about the uploadId
@@ -418,6 +419,9 @@ type ListPartsInfo struct {
 
 	// ChecksumAlgorithm if set
 	ChecksumAlgorithm string
+
+	// ChecksumType if set
+	ChecksumType string
 }
 
 // Lookup - returns if uploadID is valid
@@ -596,10 +600,11 @@ type PartInfo struct {
 	ActualSize int64
 
 	// Checksum values
-	ChecksumCRC32  string
-	ChecksumCRC32C string
-	ChecksumSHA1   string
-	ChecksumSHA256 string
+	ChecksumCRC32     string
+	ChecksumCRC32C    string
+	ChecksumSHA1      string
+	ChecksumSHA256    string
+	ChecksumCRC64NVME string
 }
 
 // CompletePart - represents the part that was completed, this is sent by the client
@@ -612,11 +617,14 @@ type CompletePart struct {
 	// Entity tag returned when the part was uploaded.
 	ETag string
 
+	Size int64
+
 	// Checksum values. Optional.
-	ChecksumCRC32  string
-	ChecksumCRC32C string
-	ChecksumSHA1   string
-	ChecksumSHA256 string
+	ChecksumCRC32     string
+	ChecksumCRC32C    string
+	ChecksumSHA1      string
+	ChecksumSHA256    string
+	ChecksumCRC64NVME string
 }
 
 // CompleteMultipartUpload - represents list of parts which are completed, this is sent by the
@@ -629,6 +637,7 @@ type CompleteMultipartUpload struct {
 type NewMultipartUploadResult struct {
 	UploadID     string
 	ChecksumAlgo string
+	ChecksumType string
 }
 
 type getObjectAttributesResponse struct {
@@ -640,10 +649,11 @@ type getObjectAttributesResponse struct {
 }
 
 type objectAttributesChecksum struct {
-	ChecksumCRC32  string `xml:",omitempty"`
-	ChecksumCRC32C string `xml:",omitempty"`
-	ChecksumSHA1   string `xml:",omitempty"`
-	ChecksumSHA256 string `xml:",omitempty"`
+	ChecksumCRC32     string `xml:",omitempty"`
+	ChecksumCRC32C    string `xml:",omitempty"`
+	ChecksumSHA1      string `xml:",omitempty"`
+	ChecksumSHA256    string `xml:",omitempty"`
+	ChecksumCRC64NVME string `xml:",omitempty"`
 }
 
 type objectAttributesParts struct {
@@ -656,12 +666,13 @@ type objectAttributesParts struct {
 }
 
 type objectAttributesPart struct {
-	PartNumber     int
-	Size           int64
-	ChecksumCRC32  string `xml:",omitempty"`
-	ChecksumCRC32C string `xml:",omitempty"`
-	ChecksumSHA1   string `xml:",omitempty"`
-	ChecksumSHA256 string `xml:",omitempty"`
+	PartNumber        int
+	Size              int64
+	ChecksumCRC32     string `xml:",omitempty"`
+	ChecksumCRC32C    string `xml:",omitempty"`
+	ChecksumSHA1      string `xml:",omitempty"`
+	ChecksumSHA256    string `xml:",omitempty"`
+	ChecksumCRC64NVME string `xml:",omitempty"`
 }
 
 type objectAttributesErrorResponse struct {
