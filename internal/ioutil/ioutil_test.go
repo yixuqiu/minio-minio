@@ -41,6 +41,26 @@ func (w *sleepWriter) Close() error {
 	return nil
 }
 
+func TestDeadlineWorker(t *testing.T) {
+	work := NewDeadlineWorker(500 * time.Millisecond)
+
+	err := work.Run(func() error {
+		time.Sleep(600 * time.Millisecond)
+		return nil
+	})
+	if err != context.DeadlineExceeded {
+		t.Error("DeadlineWorker shouldn't be successful - should return context.DeadlineExceeded")
+	}
+
+	err = work.Run(func() error {
+		time.Sleep(450 * time.Millisecond)
+		return nil
+	})
+	if err != nil {
+		t.Error("DeadlineWorker should succeed")
+	}
+}
+
 func TestDeadlineWriter(t *testing.T) {
 	w := NewDeadlineWriter(&sleepWriter{timeout: 500 * time.Millisecond}, 450*time.Millisecond)
 	_, err := w.Write([]byte("1"))
@@ -82,7 +102,7 @@ func TestCloseOnWriter(t *testing.T) {
 
 // Test for AppendFile.
 func TestAppendFile(t *testing.T) {
-	f, err := os.CreateTemp("", "")
+	f, err := os.CreateTemp(t.TempDir(), "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -91,7 +111,7 @@ func TestAppendFile(t *testing.T) {
 	f.WriteString("aaaaaaaaaa")
 	f.Close()
 
-	f, err = os.CreateTemp("", "")
+	f, err = os.CreateTemp(t.TempDir(), "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -142,7 +162,7 @@ func TestSkipReader(t *testing.T) {
 }
 
 func TestSameFile(t *testing.T) {
-	f, err := os.CreateTemp("", "")
+	f, err := os.CreateTemp(t.TempDir(), "")
 	if err != nil {
 		t.Errorf("Error creating tmp file: %v", err)
 	}
@@ -173,7 +193,7 @@ func TestSameFile(t *testing.T) {
 }
 
 func TestCopyAligned(t *testing.T) {
-	f, err := os.CreateTemp("", "")
+	f, err := os.CreateTemp(t.TempDir(), "")
 	if err != nil {
 		t.Errorf("Error creating tmp file: %v", err)
 	}
@@ -182,7 +202,7 @@ func TestCopyAligned(t *testing.T) {
 
 	r := strings.NewReader("hello world")
 
-	bufp := ODirectPoolSmall.Get().(*[]byte)
+	bufp := ODirectPoolSmall.Get()
 	defer ODirectPoolSmall.Put(bufp)
 
 	written, err := CopyAligned(f, io.LimitReader(r, 5), *bufp, r.Size(), f)

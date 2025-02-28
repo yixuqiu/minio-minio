@@ -133,7 +133,7 @@ func (bh *bucketHTTPStats) updateHTTPStats(bucket, api string, w *xhttp.Response
 		bucketHTTPRequestsDuration.With(prometheus.Labels{
 			"api":    api,
 			"bucket": bucket,
-		}).Observe(w.TimeToFirstByte.Seconds())
+		}).Observe(w.TTFB().Seconds())
 	}
 
 	bh.Lock()
@@ -266,6 +266,28 @@ func (s *bucketConnStats) getS3InOutBytes() map[string]inOutBytes {
 			Out: v.s3OutputBytes,
 		}
 	}
+	return bucketStats
+}
+
+// Return S3 total input/output bytes for each
+func (s *bucketConnStats) getBucketS3InOutBytes(buckets []string) map[string]inOutBytes {
+	s.RLock()
+	defer s.RUnlock()
+
+	if len(s.stats) == 0 || len(buckets) == 0 {
+		return nil
+	}
+
+	bucketStats := make(map[string]inOutBytes, len(buckets))
+	for _, bucket := range buckets {
+		if stats, ok := s.stats[bucket]; ok {
+			bucketStats[bucket] = inOutBytes{
+				In:  stats.s3InputBytes,
+				Out: stats.s3OutputBytes,
+			}
+		}
+	}
+
 	return bucketStats
 }
 
@@ -411,7 +433,7 @@ func (st *HTTPStats) updateStats(api string, w *xhttp.ResponseRecorder) {
 	st.totalS3Requests.Inc(api)
 
 	// Increment the prometheus http request response histogram with appropriate label
-	httpRequestsDuration.With(prometheus.Labels{"api": api}).Observe(w.TimeToFirstByte.Seconds())
+	httpRequestsDuration.With(prometheus.Labels{"api": api}).Observe(w.TTFB().Seconds())
 
 	code := w.StatusCode
 

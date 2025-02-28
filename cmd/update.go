@@ -38,8 +38,8 @@ import (
 	"github.com/klauspost/compress/zstd"
 	xhttp "github.com/minio/minio/internal/http"
 	"github.com/minio/minio/internal/logger"
-	"github.com/minio/pkg/v2/env"
-	xnet "github.com/minio/pkg/v2/net"
+	"github.com/minio/pkg/v3/env"
+	xnet "github.com/minio/pkg/v3/net"
 	"github.com/minio/selfupdate"
 	gopsutilcpu "github.com/shirou/gopsutil/v3/cpu"
 	"github.com/valyala/bytebufferpool"
@@ -142,7 +142,7 @@ func IsDocker() bool {
 	}
 
 	// Log error, as we will not propagate it to caller
-	logger.LogIf(GlobalContext, err)
+	internalLogIf(GlobalContext, err)
 
 	return err == nil
 }
@@ -172,7 +172,7 @@ func IsBOSH() bool {
 	}
 
 	// Log error, as we will not propagate it to caller
-	logger.LogIf(GlobalContext, err)
+	internalLogIf(GlobalContext, err)
 
 	return err == nil
 }
@@ -189,7 +189,7 @@ func getHelmVersion(helmInfoFilePath string) string {
 		if !osIsNotExist(err) {
 			reqInfo := (&logger.ReqInfo{}).AppendTags("helmInfoFilePath", helmInfoFilePath)
 			ctx := logger.SetReqInfo(GlobalContext, reqInfo)
-			logger.LogIf(ctx, err)
+			internalLogIf(ctx, err)
 		}
 		return ""
 	}
@@ -420,7 +420,7 @@ func parseReleaseData(data string) (sha256Sum []byte, releaseTime time.Time, rel
 func getUpdateTransport(timeout time.Duration) http.RoundTripper {
 	var updateTransport http.RoundTripper = &http.Transport{
 		Proxy:                 http.ProxyFromEnvironment,
-		DialContext:           xhttp.NewCustomDialContext(timeout, globalTCPOptions),
+		DialContext:           xhttp.NewInternodeDialContext(timeout, globalTCPOptions),
 		IdleConnTimeout:       timeout,
 		TLSHandshakeTimeout:   timeout,
 		ExpectContinueTimeout: timeout,

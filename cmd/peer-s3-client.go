@@ -21,6 +21,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"sort"
 	"strconv"
 	"sync/atomic"
@@ -28,9 +29,7 @@ import (
 
 	"github.com/minio/madmin-go/v3"
 	"github.com/minio/minio/internal/grid"
-	"github.com/minio/minio/internal/logger"
-	"github.com/minio/pkg/v2/sync/errgroup"
-	"golang.org/x/exp/slices"
+	"github.com/minio/pkg/v3/sync/errgroup"
 )
 
 var errPeerOffline = errors.New("peer is offline")
@@ -139,8 +138,12 @@ func (sys *S3PeerSys) HealBucket(ctx context.Context, bucket string, opts madmin
 		poolErrs = append(poolErrs, reduceWriteQuorumErrs(ctx, perPoolErrs, bucketOpIgnoredErrs, quorum))
 	}
 
-	opts.Remove = isAllBucketsNotFound(poolErrs)
-	opts.Recreate = !opts.Remove
+	if !opts.Recreate {
+		// when there is no force recreate look for pool
+		// errors to recreate the bucket on all pools.
+		opts.Remove = isAllBucketsNotFound(poolErrs)
+		opts.Recreate = !opts.Remove
+	}
 
 	g = errgroup.WithNErrs(len(sys.peerClients))
 	healBucketResults := make([]madmin.HealResultItem, len(sys.peerClients))
@@ -175,13 +178,24 @@ func (sys *S3PeerSys) HealBucket(ctx context.Context, bucket string, opts madmin
 		}
 	}
 
+	if healBucketErr := reduceWriteQuorumErrs(ctx, errs, bucketOpIgnoredErrs, len(errs)/2+1); healBucketErr != nil {
+		return madmin.HealResultItem{}, toObjectErr(healBucketErr, bucket)
+	}
+
+	res := madmin.HealResultItem{
+		Type:     madmin.HealItemBucket,
+		Bucket:   bucket,
+		SetCount: -1, // explicitly set an invalid value -1, for bucket heal scenario
+	}
+
 	for i, err := range errs {
 		if err == nil {
-			return healBucketResults[i], nil
+			res.Before.Drives = append(res.Before.Drives, healBucketResults[i].Before.Drives...)
+			res.After.Drives = append(res.After.Drives, healBucketResults[i].After.Drives...)
 		}
 	}
 
-	return madmin.HealResultItem{}, toObjectErr(errVolumeNotFound, bucket)
+	return res, nil
 }
 
 // ListBuckets lists buckets across all nodes and returns a consistent view:
@@ -255,9 +269,9 @@ func (sys *S3PeerSys) ListBuckets(ctx context.Context, opts BucketOptions) ([]Bu
 		for bktName, count := range bucketsMap {
 			if count < quorum {
 				// Queue a bucket heal task
-				globalMRFState.addPartialOp(partialOperation{
-					bucket: bktName,
-					queued: time.Now(),
+				globalMRFState.addPartialOp(PartialOperation{
+					Bucket: bktName,
+					Queued: time.Now(),
 				})
 			}
 		}
@@ -321,6 +335,9 @@ func (sys *S3PeerSys) GetBucketInfo(ctx context.Context, bucket string, opts Buc
 }
 
 func (client *remotePeerS3Client) ListBuckets(ctx context.Context, opts BucketOptions) ([]BucketInfo, error) {
+	ctx, cancel := context.WithTimeout(ctx, globalDriveConfig.GetMaxTimeout())
+	defer cancel()
+
 	bi, err := listBucketsRPC.Call(ctx, client.gridConn(), &opts)
 	if err != nil {
 		return nil, toStorageErr(err)
@@ -346,14 +363,11 @@ func (client *remotePeerS3Client) HealBucket(ctx context.Context, bucket string,
 		peerS3BucketDeleted: strconv.FormatBool(opts.Remove),
 	})
 
-	_, err := healBucketRPC.Call(ctx, conn, mss)
+	ctx, cancel := context.WithTimeout(ctx, globalDriveConfig.GetMaxTimeout())
+	defer cancel()
 
-	// Initialize heal result info
-	return madmin.HealResultItem{
-		Type:     madmin.HealItemBucket,
-		Bucket:   bucket,
-		SetCount: -1, // explicitly set an invalid value -1, for bucket heal scenario
-	}, toStorageErr(err)
+	resp, err := healBucketRPC.Call(ctx, conn, mss)
+	return resp.ValueOrZero(), toStorageErr(err)
 }
 
 // GetBucketInfo returns bucket stat info from a peer
@@ -368,6 +382,9 @@ func (client *remotePeerS3Client) GetBucketInfo(ctx context.Context, bucket stri
 		peerS3BucketDeleted: strconv.FormatBool(opts.Deleted),
 	})
 
+	ctx, cancel := context.WithTimeout(ctx, globalDriveConfig.GetMaxTimeout())
+	defer cancel()
+
 	volInfo, err := headBucketRPC.Call(ctx, conn, mss)
 	if err != nil {
 		return BucketInfo{}, toStorageErr(err)
@@ -376,6 +393,7 @@ func (client *remotePeerS3Client) GetBucketInfo(ctx context.Context, bucket stri
 	return BucketInfo{
 		Name:    volInfo.Name,
 		Created: volInfo.Created,
+		Deleted: volInfo.Deleted,
 	}, nil
 }
 
@@ -418,6 +436,9 @@ func (client *remotePeerS3Client) MakeBucket(ctx context.Context, bucket string,
 		peerS3Bucket:            bucket,
 		peerS3BucketForceCreate: strconv.FormatBool(opts.ForceCreate),
 	})
+
+	ctx, cancel := context.WithTimeout(ctx, globalDriveConfig.GetMaxTimeout())
+	defer cancel()
 
 	_, err := makeBucketRPC.Call(ctx, conn, mss)
 	return toStorageErr(err)
@@ -468,6 +489,9 @@ func (client *remotePeerS3Client) DeleteBucket(ctx context.Context, bucket strin
 		peerS3BucketForceDelete: strconv.FormatBool(opts.Force),
 	})
 
+	ctx, cancel := context.WithTimeout(ctx, globalDriveConfig.GetMaxTimeout())
+	defer cancel()
+
 	_, err := deleteBucketRPC.Call(ctx, conn, mss)
 	return toStorageErr(err)
 }
@@ -511,7 +535,7 @@ func newPeerS3Client(node Node) peerS3Client {
 			// Lazy initialization of grid connection.
 			// When we create this peer client, the grid connection is likely not yet initialized.
 			if node.GridHost == "" {
-				logger.LogOnceIf(context.Background(), fmt.Errorf("gridHost is empty for peer %s", node.Host), node.Host+":gridHost")
+				bugLogIf(context.Background(), fmt.Errorf("gridHost is empty for peer %s", node.Host), node.Host+":gridHost")
 				return nil
 			}
 			gc := gridConn.Load()
@@ -524,7 +548,7 @@ func newPeerS3Client(node Node) peerS3Client {
 			}
 			gc = gm.Connection(node.GridHost)
 			if gc == nil {
-				logger.LogOnceIf(context.Background(), fmt.Errorf("gridHost %s not found for peer %s", node.GridHost, node.Host), node.Host+":gridHost")
+				bugLogIf(context.Background(), fmt.Errorf("gridHost %s not found for peer %s", node.GridHost, node.Host), node.Host+":gridHost")
 				return nil
 			}
 			gridConn.Store(gc)

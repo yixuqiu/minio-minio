@@ -28,6 +28,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"mime"
 	"mime/multipart"
 	"net/http"
 	"net/textproto"
@@ -51,9 +52,9 @@ import (
 	sse "github.com/minio/minio/internal/bucket/encryption"
 	objectlock "github.com/minio/minio/internal/bucket/object/lock"
 	"github.com/minio/minio/internal/bucket/replication"
-	"github.com/minio/minio/internal/config/cache"
 	"github.com/minio/minio/internal/config/dns"
 	"github.com/minio/minio/internal/crypto"
+	"github.com/minio/minio/internal/etag"
 	"github.com/minio/minio/internal/event"
 	"github.com/minio/minio/internal/handlers"
 	"github.com/minio/minio/internal/hash"
@@ -61,8 +62,8 @@ import (
 	"github.com/minio/minio/internal/ioutil"
 	"github.com/minio/minio/internal/kms"
 	"github.com/minio/minio/internal/logger"
-	"github.com/minio/pkg/v2/policy"
-	"github.com/minio/pkg/v2/sync/errgroup"
+	"github.com/minio/pkg/v3/policy"
+	"github.com/minio/pkg/v3/sync/errgroup"
 )
 
 const (
@@ -72,6 +73,8 @@ const (
 
 	xMinIOErrCodeHeader = "x-minio-error-code"
 	xMinIOErrDescHeader = "x-minio-error-desc"
+
+	postPolicyBucketTagging = "tagging"
 )
 
 // Check if there are buckets on server without corresponding entry in etcd backend and
@@ -90,7 +93,7 @@ const (
 // -- If IP of the entry doesn't match, this means entry is
 //
 //	for another instance. Log an error to console.
-func initFederatorBackend(buckets []BucketInfo, objLayer ObjectLayer) {
+func initFederatorBackend(buckets []string, objLayer ObjectLayer) {
 	if len(buckets) == 0 {
 		return
 	}
@@ -98,7 +101,7 @@ func initFederatorBackend(buckets []BucketInfo, objLayer ObjectLayer) {
 	// Get buckets in the DNS
 	dnsBuckets, err := globalDNSConfig.List()
 	if err != nil && !IsErrIgnored(err, dns.ErrNoEntriesFound, dns.ErrNotImplemented, dns.ErrDomainMissing) {
-		logger.LogIf(GlobalContext, err)
+		dnsLogIf(GlobalContext, err)
 		return
 	}
 
@@ -111,10 +114,10 @@ func initFederatorBackend(buckets []BucketInfo, objLayer ObjectLayer) {
 	domainMissing := err == dns.ErrDomainMissing
 	if dnsBuckets != nil {
 		for _, bucket := range buckets {
-			bucketsSet.Add(bucket.Name)
-			r, ok := dnsBuckets[bucket.Name]
+			bucketsSet.Add(bucket)
+			r, ok := dnsBuckets[bucket]
 			if !ok {
-				bucketsToBeUpdated.Add(bucket.Name)
+				bucketsToBeUpdated.Add(bucket)
 				continue
 			}
 			if !globalDomainIPs.Intersection(set.CreateStringSet(getHostsSlice(r)...)).IsEmpty() {
@@ -133,7 +136,7 @@ func initFederatorBackend(buckets []BucketInfo, objLayer ObjectLayer) {
 				// but if we do see a difference with local domain IPs with
 				// hostSlice from etcd then we should update with newer
 				// domainIPs, we proceed to do that here.
-				bucketsToBeUpdated.Add(bucket.Name)
+				bucketsToBeUpdated.Add(bucket)
 				continue
 			}
 
@@ -142,7 +145,7 @@ func initFederatorBackend(buckets []BucketInfo, objLayer ObjectLayer) {
 			// bucket names are globally unique in federation at a given
 			// path prefix, name collision is not allowed. We simply log
 			// an error and continue.
-			bucketsInConflict.Add(bucket.Name)
+			bucketsInConflict.Add(bucket)
 		}
 	}
 
@@ -160,13 +163,13 @@ func initFederatorBackend(buckets []BucketInfo, objLayer ObjectLayer) {
 	ctx := GlobalContext
 	for _, err := range g.Wait() {
 		if err != nil {
-			logger.LogIf(ctx, err)
+			dnsLogIf(ctx, err)
 			return
 		}
 	}
 
 	for _, bucket := range bucketsInConflict.ToSlice() {
-		logger.LogIf(ctx, fmt.Errorf("Unable to add bucket DNS entry for bucket %s, an entry exists for the same bucket by a different tenant. This local bucket will be ignored. Bucket names are globally unique in federated deployments. Use path style requests on following addresses '%v' to access this bucket", bucket, globalDomainIPs.ToSlice()))
+		dnsLogIf(ctx, fmt.Errorf("Unable to add bucket DNS entry for bucket %s, an entry exists for the same bucket by a different tenant. This local bucket will be ignored. Bucket names are globally unique in federated deployments. Use path style requests on following addresses '%v' to access this bucket", bucket, globalDomainIPs.ToSlice()))
 	}
 
 	var wg sync.WaitGroup
@@ -187,7 +190,7 @@ func initFederatorBackend(buckets []BucketInfo, objLayer ObjectLayer) {
 			// We go to here, so we know the bucket no longer exists,
 			// but is registered in DNS to this server
 			if err := globalDNSConfig.Delete(bucket); err != nil {
-				logger.LogIf(GlobalContext, fmt.Errorf("Failed to remove DNS entry for %s due to %w",
+				dnsLogIf(GlobalContext, fmt.Errorf("Failed to remove DNS entry for %s due to %w",
 					bucket, err))
 			}
 		}(bucket)
@@ -227,7 +230,7 @@ func (api objectAPIHandlers) GetBucketLocationHandler(w http.ResponseWriter, r *
 	// Generate response.
 	encodedSuccessResponse := encodeResponse(LocationResponse{})
 	// Get current region.
-	region := globalSite.Region
+	region := globalSite.Region()
 	if region != globalMinioDefaultRegion {
 		encodedSuccessResponse = encodeResponse(LocationResponse{
 			Location: region,
@@ -341,11 +344,9 @@ func (api objectAPIHandlers) ListBucketsHandler(w http.ResponseWriter, r *http.R
 				Created: dnsRecords[0].CreationDate,
 			})
 		}
-
 		sort.Slice(bucketsInfo, func(i, j int) bool {
 			return bucketsInfo[i].Name < bucketsInfo[j].Name
 		})
-
 	} else {
 		// Invoke the list buckets.
 		var err error
@@ -426,7 +427,7 @@ func (api objectAPIHandlers) DeleteMultipleObjectsHandler(w http.ResponseWriter,
 
 	// Content-Md5 is required should be set
 	// http://docs.aws.amazon.com/AmazonS3/latest/API/multiobjectdeleteapi.html
-	if _, ok := r.Header[xhttp.ContentMD5]; !ok {
+	if !validateLengthAndChecksum(r) {
 		writeErrorResponse(ctx, w, errorCodes.ToAPIErr(ErrMissingContentMD5), r.URL)
 		return
 	}
@@ -668,8 +669,6 @@ func (api objectAPIHandlers) DeleteMultipleObjectsHandler(w http.ResponseWriter,
 			continue
 		}
 
-		defer globalCacheConfig.Delete(bucket, dobj.ObjectName)
-
 		if replicateDeletes && (dobj.DeleteMarkerReplicationStatus() == replication.Pending || dobj.VersionPurgeStatus() == Pending) {
 			// copy so we can re-add null ID.
 			dobj := dobj
@@ -790,7 +789,7 @@ func (api objectAPIHandlers) PutBucketHandler(w http.ResponseWriter, r *http.Req
 
 	// check if client is attempting to create more buckets, complain about it.
 	if currBuckets := globalBucketMetadataSys.Count(); currBuckets+1 > maxBuckets {
-		logger.LogIf(ctx, fmt.Errorf("Please avoid creating more buckets %d beyond recommended %d", currBuckets+1, maxBuckets))
+		internalLogIf(ctx, fmt.Errorf("Please avoid creating more buckets %d beyond recommended %d", currBuckets+1, maxBuckets), logger.WarningKind)
 	}
 
 	opts := MakeBucketOptions{
@@ -840,7 +839,6 @@ func (api objectAPIHandlers) PutBucketHandler(w http.ResponseWriter, r *http.Req
 			}
 			writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
 			return
-
 		}
 		apiErr := ErrBucketAlreadyExists
 		if !globalDomainIPs.Intersection(set.CreateStringSet(getHostsSlice(sr)...)).IsEmpty() {
@@ -871,7 +869,7 @@ func (api objectAPIHandlers) PutBucketHandler(w http.ResponseWriter, r *http.Req
 	globalNotificationSys.LoadBucketMetadata(GlobalContext, bucket)
 
 	// Call site replication hook
-	logger.LogIf(ctx, globalSiteReplicationSys.MakeBucketHook(ctx, bucket, opts))
+	replLogIf(ctx, globalSiteReplicationSys.MakeBucketHook(ctx, bucket, opts))
 
 	// Make sure to add Location information here only for bucket
 	w.Header().Set(xhttp.Location, pathJoin(SlashSeparator, bucket))
@@ -886,6 +884,30 @@ func (api objectAPIHandlers) PutBucketHandler(w http.ResponseWriter, r *http.Req
 		UserAgent:    r.UserAgent(),
 		Host:         handlers.GetSourceIP(r),
 	})
+}
+
+// multipartReader is just like https://pkg.go.dev/net/http#Request.MultipartReader but
+// rejects multipart/mixed as its not supported in S3 API.
+func multipartReader(r *http.Request) (*multipart.Reader, error) {
+	v := r.Header.Get("Content-Type")
+	if v == "" {
+		return nil, http.ErrNotMultipart
+	}
+	if r.Body == nil {
+		return nil, errors.New("missing form body")
+	}
+	d, params, err := mime.ParseMediaType(v)
+	if err != nil {
+		return nil, http.ErrNotMultipart
+	}
+	if d != "multipart/form-data" {
+		return nil, http.ErrNotMultipart
+	}
+	boundary, ok := params["boundary"]
+	if !ok {
+		return nil, http.ErrMissingBoundary
+	}
+	return multipart.NewReader(r.Body, boundary), nil
 }
 
 // PostPolicyBucketHandler - POST policy
@@ -921,9 +943,14 @@ func (api objectAPIHandlers) PostPolicyBucketHandler(w http.ResponseWriter, r *h
 		return
 	}
 
+	if r.ContentLength <= 0 {
+		writeErrorResponse(ctx, w, errorCodes.ToAPIErr(ErrEmptyRequestBody), r.URL)
+		return
+	}
+
 	// Here the parameter is the size of the form data that should
 	// be loaded in memory, the remaining being put in temporary files.
-	mp, err := r.MultipartReader()
+	mp, err := multipartReader(r)
 	if err != nil {
 		apiErr := errorCodes.ToAPIErr(ErrMalformedPOSTRequest)
 		apiErr.Description = fmt.Sprintf("%s (%v)", apiErr.Description, err)
@@ -935,7 +962,7 @@ func (api objectAPIHandlers) PostPolicyBucketHandler(w http.ResponseWriter, r *h
 
 	var (
 		reader        io.Reader
-		fileSize      int64 = -1
+		actualSize    int64 = -1
 		fileName      string
 		fanOutEntries = make([]minio.PutObjectFanOutEntry, 0, 100)
 	)
@@ -943,6 +970,7 @@ func (api objectAPIHandlers) PostPolicyBucketHandler(w http.ResponseWriter, r *h
 	maxParts := 1000
 	// Canonicalize the form values into http.Header.
 	formValues := make(http.Header)
+	var headerLen int64
 	for {
 		part, err := mp.NextRawPart()
 		if errors.Is(err, io.EOF) {
@@ -984,7 +1012,7 @@ func (api objectAPIHandlers) PostPolicyBucketHandler(w http.ResponseWriter, r *h
 			return
 		}
 
-		var b bytes.Buffer
+		headerLen += int64(len(name)) + int64(len(fileName))
 		if name != "file" {
 			if http.CanonicalHeaderKey(name) == http.CanonicalHeaderKey("x-minio-fanout-list") {
 				dec := json.NewDecoder(part)
@@ -995,7 +1023,7 @@ func (api objectAPIHandlers) PostPolicyBucketHandler(w http.ResponseWriter, r *h
 					if err := dec.Decode(&m); err != nil {
 						part.Close()
 						apiErr := errorCodes.ToAPIErr(ErrMalformedPOSTRequest)
-						apiErr.Description = fmt.Sprintf("%s (%v)", apiErr.Description, multipart.ErrMessageTooLarge)
+						apiErr.Description = fmt.Sprintf("%s (%v)", apiErr.Description, err)
 						writeErrorResponse(ctx, w, apiErr, r.URL)
 						return
 					}
@@ -1005,8 +1033,12 @@ func (api objectAPIHandlers) PostPolicyBucketHandler(w http.ResponseWriter, r *h
 				continue
 			}
 
+			buf := bytebufferpool.Get()
 			// value, store as string in memory
-			n, err := io.CopyN(&b, part, maxMemoryBytes+1)
+			n, err := io.CopyN(buf, part, maxMemoryBytes+1)
+			value := buf.String()
+			buf.Reset()
+			bytebufferpool.Put(buf)
 			part.Close()
 
 			if err != nil && err != io.EOF {
@@ -1028,7 +1060,8 @@ func (api objectAPIHandlers) PostPolicyBucketHandler(w http.ResponseWriter, r *h
 				writeErrorResponse(ctx, w, apiErr, r.URL)
 				return
 			}
-			formValues[http.CanonicalHeaderKey(name)] = append(formValues[http.CanonicalHeaderKey(name)], b.String())
+			headerLen += n
+			formValues[http.CanonicalHeaderKey(name)] = append(formValues[http.CanonicalHeaderKey(name)], value)
 			continue
 		}
 
@@ -1037,6 +1070,21 @@ func (api objectAPIHandlers) PostPolicyBucketHandler(w http.ResponseWriter, r *h
 		// The file or text content must be the last field in the form.
 		// You cannot upload more than one file at a time.
 		reader = part
+
+		possibleShardSize := (r.ContentLength - headerLen)
+		if globalStorageClass.ShouldInline(possibleShardSize, false) { // keep versioned false for this check
+			var b bytes.Buffer
+			n, err := io.Copy(&b, reader)
+			if err != nil {
+				apiErr := errorCodes.ToAPIErr(ErrMalformedPOSTRequest)
+				apiErr.Description = fmt.Sprintf("%s (%v)", apiErr.Description, err)
+				writeErrorResponse(ctx, w, apiErr, r.URL)
+				return
+			}
+			reader = &b
+			actualSize = n
+		}
+
 		// we have found the File part of the request we are done processing multipart-form
 		break
 	}
@@ -1138,11 +1186,33 @@ func (api objectAPIHandlers) PostPolicyBucketHandler(w http.ResponseWriter, r *h
 		return
 	}
 
-	hashReader, err := hash.NewReader(ctx, reader, fileSize, "", "", fileSize)
+	clientETag, err := etag.FromContentMD5(formValues)
+	if err != nil {
+		writeErrorResponse(ctx, w, errorCodes.ToAPIErr(ErrInvalidDigest), r.URL)
+		return
+	}
+
+	var forceMD5 []byte
+	// Optimization: If SSE-KMS and SSE-C did not request Content-Md5. Use uuid as etag. Optionally enable this also
+	// for server that is started with `--no-compat`.
+	kind, _ := crypto.IsRequested(formValues)
+	if !etag.ContentMD5Requested(formValues) && (kind == crypto.SSEC || kind == crypto.S3KMS || !globalServerCtxt.StrictS3Compat) {
+		forceMD5 = mustGetUUIDBytes()
+	}
+
+	hashReader, err := hash.NewReaderWithOpts(ctx, reader, hash.Options{
+		Size:       actualSize,
+		MD5Hex:     clientETag.String(),
+		SHA256Hex:  "",
+		ActualSize: actualSize,
+		DisableMD5: false,
+		ForceMD5:   forceMD5,
+	})
 	if err != nil {
 		writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
 		return
 	}
+
 	if checksum != nil && checksum.Valid() {
 		if err = hashReader.AddChecksumNoTrailer(formValues, false); err != nil {
 			writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
@@ -1199,9 +1269,9 @@ func (api objectAPIHandlers) PostPolicyBucketHandler(w http.ResponseWriter, r *h
 		writeErrorResponseHeadersOnly(w, toAPIError(ctx, err))
 		return
 	}
+	opts.WantChecksum = checksum
 
 	fanOutOpts := fanOutOptions{Checksum: checksum}
-
 	if crypto.Requested(formValues) {
 		if crypto.SSECopy.IsRequested(r.Header) {
 			writeErrorResponse(ctx, w, toAPIError(ctx, errInvalidEncryptionParameters), r.URL)
@@ -1215,11 +1285,6 @@ func (api objectAPIHandlers) PostPolicyBucketHandler(w http.ResponseWriter, r *h
 
 		if crypto.SSEC.IsRequested(r.Header) && crypto.S3KMS.IsRequested(r.Header) {
 			writeErrorResponse(ctx, w, toAPIError(ctx, crypto.ErrIncompatibleEncryptionMethod), r.URL)
-			return
-		}
-
-		if crypto.SSEC.IsRequested(r.Header) && isReplicationEnabled(ctx, bucket) {
-			writeErrorResponse(ctx, w, toAPIError(ctx, errInvalidEncryptionParametersSSEC), r.URL)
 			return
 		}
 
@@ -1251,8 +1316,15 @@ func (api objectAPIHandlers) PostPolicyBucketHandler(w http.ResponseWriter, r *h
 				writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
 				return
 			}
+
+			wantSize := int64(-1)
+			if actualSize >= 0 {
+				info := ObjectInfo{Size: actualSize}
+				wantSize = info.EncryptedSize()
+			}
+
 			// do not try to verify encrypted content/
-			hashReader, err = hash.NewReader(ctx, reader, -1, "", "", -1)
+			hashReader, err = hash.NewReader(ctx, reader, wantSize, "", "", actualSize)
 			if err != nil {
 				writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
 				return
@@ -1263,6 +1335,7 @@ func (api objectAPIHandlers) PostPolicyBucketHandler(w http.ResponseWriter, r *h
 					return
 				}
 			}
+			opts.EncryptFn = metadataEncrypter(objectEncryptionKey)
 			pReader, err = pReader.WithEncryption(hashReader, &objectEncryptionKey)
 			if err != nil {
 				writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
@@ -1332,7 +1405,6 @@ func (api objectAPIHandlers) PostPolicyBucketHandler(w http.ResponseWriter, r *h
 						Key:   objInfo.Name,
 						Error: errs[i].Error(),
 					})
-
 					eventArgsList = append(eventArgsList, eventArgs{
 						EventName:    event.ObjectCreatedPost,
 						BucketName:   objInfo.Bucket,
@@ -1344,22 +1416,6 @@ func (api objectAPIHandlers) PostPolicyBucketHandler(w http.ResponseWriter, r *h
 					})
 					continue
 				}
-
-				asize, err := objInfo.GetActualSize()
-				if err != nil {
-					asize = objInfo.Size
-				}
-
-				globalCacheConfig.Set(&cache.ObjectInfo{
-					Key:          objInfo.Name,
-					Bucket:       objInfo.Bucket,
-					ETag:         getDecryptedETag(formValues, objInfo, false),
-					ModTime:      objInfo.ModTime,
-					Expires:      objInfo.Expires.UTC().Format(http.TimeFormat),
-					CacheControl: objInfo.CacheControl,
-					Metadata:     cleanReservedKeys(objInfo.UserDefined),
-					Size:         asize,
-				})
 
 				fanOutResp = append(fanOutResp, minio.PutObjectFanOutResponse{
 					Key:          objInfo.Name,
@@ -1420,6 +1476,19 @@ func (api objectAPIHandlers) PostPolicyBucketHandler(w http.ResponseWriter, r *h
 		return
 	}
 
+	if formValues.Get(postPolicyBucketTagging) != "" {
+		tags, err := tags.ParseObjectXML(strings.NewReader(formValues.Get(postPolicyBucketTagging)))
+		if err != nil {
+			writeErrorResponse(ctx, w, errorCodes.ToAPIErr(ErrMalformedPOSTRequest), r.URL)
+			return
+		}
+		tagsStr := tags.String()
+		opts.UserDefined[xhttp.AmzObjectTagging] = tagsStr
+	} else {
+		// avoid user set an invalid tag using `X-Amz-Tagging`
+		delete(opts.UserDefined, xhttp.AmzObjectTagging)
+	}
+
 	objInfo, err := objectAPI.PutObject(ctx, bucket, object, pReader, opts)
 	if err != nil {
 		writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
@@ -1441,22 +1510,6 @@ func (api objectAPIHandlers) PostPolicyBucketHandler(w http.ResponseWriter, r *h
 	if obj := getObjectLocation(r, globalDomainNames, bucket, object); obj != "" {
 		w.Header().Set(xhttp.Location, obj)
 	}
-
-	asize, err := objInfo.GetActualSize()
-	if err != nil {
-		asize = objInfo.Size
-	}
-
-	defer globalCacheConfig.Set(&cache.ObjectInfo{
-		Key:          objInfo.Name,
-		Bucket:       objInfo.Bucket,
-		ETag:         etag,
-		ModTime:      objInfo.ModTime,
-		Expires:      objInfo.ExpiresStr(),
-		CacheControl: objInfo.CacheControl,
-		Metadata:     cleanReservedKeys(objInfo.UserDefined),
-		Size:         asize,
-	})
 
 	// Notify object created event.
 	defer sendEvent(eventArgs{
@@ -1666,7 +1719,7 @@ func (api objectAPIHandlers) DeleteBucketHandler(w http.ResponseWriter, r *http.
 					writeErrorResponse(ctx, w, errorCodes.ToAPIErr(ErrMethodNotAllowed), r.URL)
 					return
 				}
-			case rcfg.HasActiveRules("", true):
+			case rcfg != nil && rcfg.HasActiveRules("", true):
 				writeErrorResponse(ctx, w, errorCodes.ToAPIErr(ErrMethodNotAllowed), r.URL)
 				return
 			}
@@ -1698,17 +1751,17 @@ func (api objectAPIHandlers) DeleteBucketHandler(w http.ResponseWriter, r *http.
 
 	if globalDNSConfig != nil {
 		if err := globalDNSConfig.Delete(bucket); err != nil {
-			logger.LogIf(ctx, fmt.Errorf("Unable to delete bucket DNS entry %w, please delete it manually, bucket on MinIO no longer exists", err))
+			dnsLogIf(ctx, fmt.Errorf("Unable to delete bucket DNS entry %w, please delete it manually, bucket on MinIO no longer exists", err))
 			writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
 			return
 		}
 	}
 
 	globalNotificationSys.DeleteBucketMetadata(ctx, bucket)
-	globalReplicationPool.deleteResyncMetadata(ctx, bucket)
+	globalReplicationPool.Get().deleteResyncMetadata(ctx, bucket)
 
 	// Call site replication hook.
-	logger.LogIf(ctx, globalSiteReplicationSys.DeleteBucketHook(ctx, bucket, forceDelete))
+	replLogIf(ctx, globalSiteReplicationSys.DeleteBucketHook(ctx, bucket, forceDelete))
 
 	// Write success response.
 	writeSuccessNoContent(w)
@@ -1754,6 +1807,10 @@ func (api objectAPIHandlers) PutBucketObjectLockConfigHandler(w http.ResponseWri
 		return
 	}
 
+	// Audit log tags.
+	reqInfo := logger.GetReqInfo(ctx)
+	reqInfo.SetTags("retention", config.String())
+
 	configData, err := xml.Marshal(config)
 	if err != nil {
 		writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
@@ -1781,7 +1838,7 @@ func (api objectAPIHandlers) PutBucketObjectLockConfigHandler(w http.ResponseWri
 	// We encode the xml bytes as base64 to ensure there are no encoding
 	// errors.
 	cfgStr := base64.StdEncoding.EncodeToString(configData)
-	logger.LogIf(ctx, globalSiteReplicationSys.BucketMetaHook(ctx, madmin.SRBucketMeta{
+	replLogIf(ctx, globalSiteReplicationSys.BucketMetaHook(ctx, madmin.SRBucketMeta{
 		Type:             madmin.SRBucketMetaTypeObjectLockConfig,
 		Bucket:           bucket,
 		ObjectLockConfig: &cfgStr,
@@ -1885,7 +1942,7 @@ func (api objectAPIHandlers) PutBucketTaggingHandler(w http.ResponseWriter, r *h
 	// We encode the xml bytes as base64 to ensure there are no encoding
 	// errors.
 	cfgStr := base64.StdEncoding.EncodeToString(configData)
-	logger.LogIf(ctx, globalSiteReplicationSys.BucketMetaHook(ctx, madmin.SRBucketMeta{
+	replLogIf(ctx, globalSiteReplicationSys.BucketMetaHook(ctx, madmin.SRBucketMeta{
 		Type:      madmin.SRBucketMetaTypeTags,
 		Bucket:    bucket,
 		Tags:      &cfgStr,
@@ -1961,7 +2018,7 @@ func (api objectAPIHandlers) DeleteBucketTaggingHandler(w http.ResponseWriter, r
 		return
 	}
 
-	logger.LogIf(ctx, globalSiteReplicationSys.BucketMetaHook(ctx, madmin.SRBucketMeta{
+	replLogIf(ctx, globalSiteReplicationSys.BucketMetaHook(ctx, madmin.SRBucketMeta{
 		Type:      madmin.SRBucketMetaTypeTags,
 		Bucket:    bucket,
 		UpdatedAt: updatedAt,

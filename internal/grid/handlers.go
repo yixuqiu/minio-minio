@@ -23,11 +23,10 @@ import (
 	"errors"
 	"fmt"
 	"strings"
-	"sync"
 
+	"github.com/minio/minio/internal/bpool"
 	"github.com/minio/minio/internal/hash/sha256"
 	xioutil "github.com/minio/minio/internal/ioutil"
-	"github.com/minio/minio/internal/logger"
 	"github.com/tinylib/msgp/msgp"
 )
 
@@ -111,6 +110,12 @@ const (
 	HandlerGetBandwidth
 	HandlerWriteAll
 	HandlerListBuckets
+	HandlerRenameDataInline
+	HandlerRenameData2
+	HandlerCheckParts2
+	HandlerRenamePart
+	HandlerClearUploadID
+	HandlerCheckParts3
 
 	// Add more above here ^^^
 	// If all handlers are used, the type of Handler can be changed.
@@ -189,6 +194,12 @@ var handlerPrefixes = [handlerLast]string{
 	HandlerConsoleLog:                  peerPrefix,
 	HandlerListDir:                     storagePrefix,
 	HandlerListBuckets:                 peerPrefixS3,
+	HandlerRenameDataInline:            storagePrefix,
+	HandlerRenameData2:                 storagePrefix,
+	HandlerCheckParts2:                 storagePrefix,
+	HandlerCheckParts3:                 storagePrefix,
+	HandlerRenamePart:                  storagePrefix,
+	HandlerClearUploadID:               peerPrefix,
 }
 
 const (
@@ -203,7 +214,7 @@ const (
 func init() {
 	// Static check if we exceed 255 handler ids.
 	// Extend the type to uint16 when hit.
-	if handlerLast > 255 {
+	if uint32(handlerLast) > 255 {
 		panic(fmt.Sprintf("out of handler IDs. %d > %d", handlerLast, 255))
 	}
 }
@@ -420,14 +431,15 @@ func recycleFunc[RT RoundTripper](newRT func() RT) (newFn func() RT, recycle fun
 			}
 		}
 	}
-	pool := sync.Pool{
-		New: func() interface{} {
+	pool := bpool.Pool[RT]{
+		New: func() RT {
 			return newRT()
 		},
 	}
-	return func() RT { return pool.Get().(RT) },
+	return pool.Get,
 		func(r RT) {
 			if r != rZero {
+				//nolint:staticcheck // SA6002 IT IS A GENERIC VALUE!
 				pool.Put(r)
 			}
 		}
@@ -465,7 +477,7 @@ func (h *SingleHandler[Req, Resp]) AllowCallRequestPool(b bool) *SingleHandler[R
 // This may only be set ONCE before use.
 func (h *SingleHandler[Req, Resp]) IgnoreNilConn() *SingleHandler[Req, Resp] {
 	if h.ignoreNilConn {
-		logger.LogOnceIf(context.Background(), fmt.Errorf("%s: IgnoreNilConn called twice", h.id.String()), h.id.String()+"IgnoreNilConn")
+		gridLogOnceIf(context.Background(), fmt.Errorf("%s: IgnoreNilConn called twice", h.id.String()), h.id.String()+"IgnoreNilConn")
 	}
 	h.ignoreNilConn = true
 	return h
@@ -546,7 +558,7 @@ func (h *SingleHandler[Req, Resp]) Call(ctx context.Context, c Requester, req Re
 		}
 		return resp, ErrDisconnected
 	}
-	payload, err := req.MarshalMsg(GetByteBuffer()[:0])
+	payload, err := req.MarshalMsg(GetByteBufferCap(req.Msgsize()))
 	if err != nil {
 		return resp, err
 	}
@@ -594,15 +606,18 @@ func GetCaller(ctx context.Context) *RemoteClient {
 
 // GetSubroute returns caller information from contexts provided to handlers.
 func GetSubroute(ctx context.Context) string {
+	//nolint:staticcheck // SA1029 Staticcheck is drunk.
 	val, _ := ctx.Value(ctxSubrouteKey{}).(string)
 	return val
 }
 
 func setCaller(ctx context.Context, cl *RemoteClient) context.Context {
+	//nolint:staticcheck // SA1029 Staticcheck is drunk.
 	return context.WithValue(ctx, ctxCallerKey{}, cl)
 }
 
 func setSubroute(ctx context.Context, s string) context.Context {
+	//nolint:staticcheck // SA1029 Staticcheck is drunk.
 	return context.WithValue(ctx, ctxSubrouteKey{}, s)
 }
 
@@ -617,8 +632,8 @@ type StreamTypeHandler[Payload, Req, Resp RoundTripper] struct {
 	// Will be 0 if newReq is nil.
 	InCapacity int
 
-	reqPool        sync.Pool
-	respPool       sync.Pool
+	reqPool        bpool.Pool[Req]
+	respPool       bpool.Pool[Resp]
 	id             HandlerID
 	newPayload     func() Payload
 	nilReq         Req
@@ -638,13 +653,13 @@ func NewStream[Payload, Req, Resp RoundTripper](h HandlerID, newPayload func() P
 
 	s := newStreamHandler[Payload, Req, Resp](h)
 	if newReq != nil {
-		s.reqPool.New = func() interface{} {
+		s.reqPool.New = func() Req {
 			return newReq()
 		}
 	} else {
 		s.InCapacity = 0
 	}
-	s.respPool.New = func() interface{} {
+	s.respPool.New = func() Resp {
 		return newResp()
 	}
 	s.newPayload = newPayload
@@ -667,13 +682,14 @@ func (h *StreamTypeHandler[Payload, Req, Resp]) NewPayload() Payload {
 // NewRequest creates a new request.
 // The struct may be reused, so caller should clear any fields.
 func (h *StreamTypeHandler[Payload, Req, Resp]) NewRequest() Req {
-	return h.reqPool.Get().(Req)
+	return h.reqPool.Get()
 }
 
 // PutRequest will accept a request for reuse.
 // These should be returned by the handler.
 func (h *StreamTypeHandler[Payload, Req, Resp]) PutRequest(r Req) {
 	if r != h.nilReq {
+		//nolint:staticcheck // SA6002 IT IS A GENERIC VALUE! (and always a pointer)
 		h.reqPool.Put(r)
 	}
 }
@@ -682,6 +698,7 @@ func (h *StreamTypeHandler[Payload, Req, Resp]) PutRequest(r Req) {
 // These should be returned by the caller.
 func (h *StreamTypeHandler[Payload, Req, Resp]) PutResponse(r Resp) {
 	if r != h.nilResp {
+		//nolint:staticcheck // SA6002 IT IS A GENERIC VALUE! (and always a pointer)
 		h.respPool.Put(r)
 	}
 }
@@ -689,7 +706,7 @@ func (h *StreamTypeHandler[Payload, Req, Resp]) PutResponse(r Resp) {
 // NewResponse creates a new response.
 // Handlers can use this to create a reusable response.
 func (h *StreamTypeHandler[Payload, Req, Resp]) NewResponse() Resp {
-	return h.respPool.Get().(Resp)
+	return h.respPool.Get()
 }
 
 func newStreamHandler[Payload, Req, Resp RoundTripper](h HandlerID) *StreamTypeHandler[Payload, Req, Resp] {
@@ -766,7 +783,7 @@ func (h *StreamTypeHandler[Payload, Req, Resp]) register(m *Manager, handle func
 							input := h.NewRequest()
 							_, err := input.UnmarshalMsg(v)
 							if err != nil {
-								logger.LogOnceIf(ctx, err, err.Error())
+								gridLogOnceIf(ctx, err, err.Error())
 							}
 							PutByteBuffer(v)
 							// Send input
@@ -788,10 +805,9 @@ func (h *StreamTypeHandler[Payload, Req, Resp]) register(m *Manager, handle func
 					if dropOutput {
 						continue
 					}
-					dst := GetByteBuffer()
-					dst, err := v.MarshalMsg(dst[:0])
+					dst, err := v.MarshalMsg(GetByteBufferCap(v.Msgsize()))
 					if err != nil {
-						logger.LogOnceIf(ctx, err, err.Error())
+						gridLogOnceIf(ctx, err, err.Error())
 					}
 					if !h.sharedResponse {
 						h.PutResponse(v)
@@ -853,7 +869,7 @@ func (h *StreamTypeHandler[Payload, Req, Resp]) Call(ctx context.Context, c Stre
 	var payloadB []byte
 	if h.WithPayload {
 		var err error
-		payloadB, err = payload.MarshalMsg(GetByteBuffer()[:0])
+		payloadB, err = payload.MarshalMsg(GetByteBufferCap(payload.Msgsize()))
 		if err != nil {
 			return nil, err
 		}
@@ -875,9 +891,9 @@ func (h *StreamTypeHandler[Payload, Req, Resp]) Call(ctx context.Context, c Stre
 		go func() {
 			defer xioutil.SafeClose(stream.Requests)
 			for req := range reqT {
-				b, err := req.MarshalMsg(GetByteBuffer()[:0])
+				b, err := req.MarshalMsg(GetByteBufferCap(req.Msgsize()))
 				if err != nil {
-					logger.LogOnceIf(ctx, err, err.Error())
+					gridLogOnceIf(ctx, err, err.Error())
 				}
 				h.PutRequest(req)
 				stream.Requests <- b

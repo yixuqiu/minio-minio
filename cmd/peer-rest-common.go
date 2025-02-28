@@ -17,8 +17,10 @@
 
 package cmd
 
+import "time"
+
 const (
-	peerRESTVersion       = "v38" // Convert RPC calls
+	peerRESTVersion       = "v39" // add more flags to speedtest API
 	peerRESTVersionPrefix = SlashSeparator + peerRESTVersion
 	peerRESTPrefix        = minioReservedBucketPath + "/peer"
 	peerRESTPath          = peerRESTPrefix + peerRESTVersionPrefix
@@ -38,35 +40,39 @@ const (
 )
 
 const (
-	peerRESTBucket         = "bucket"
-	peerRESTBuckets        = "buckets"
-	peerRESTUser           = "user"
-	peerRESTGroup          = "group"
-	peerRESTUserTemp       = "user-temp"
-	peerRESTPolicy         = "policy"
-	peerRESTUserOrGroup    = "user-or-group"
-	peerRESTUserType       = "user-type"
-	peerRESTIsGroup        = "is-group"
-	peerRESTSignal         = "signal"
-	peerRESTSubSys         = "sub-sys"
-	peerRESTProfiler       = "profiler"
-	peerRESTSize           = "size"
-	peerRESTConcurrent     = "concurrent"
-	peerRESTDuration       = "duration"
-	peerRESTStorageClass   = "storage-class"
-	peerRESTEnableSha256   = "enableSha256"
-	peerRESTMetricsTypes   = "types"
-	peerRESTDisk           = "disk"
-	peerRESTHost           = "host"
-	peerRESTJobID          = "job-id"
-	peerRESTDepID          = "depID"
-	peerRESTStartRebalance = "start-rebalance"
-	peerRESTMetrics        = "metrics"
-	peerRESTDryRun         = "dry-run"
+	peerRESTBucket          = "bucket"
+	peerRESTBuckets         = "buckets"
+	peerRESTUser            = "user"
+	peerRESTGroup           = "group"
+	peerRESTUserTemp        = "user-temp"
+	peerRESTPolicy          = "policy"
+	peerRESTUserOrGroup     = "user-or-group"
+	peerRESTUserType        = "user-type"
+	peerRESTIsGroup         = "is-group"
+	peerRESTSignal          = "signal"
+	peerRESTSubSys          = "sub-sys"
+	peerRESTProfiler        = "profiler"
+	peerRESTSize            = "size"
+	peerRESTConcurrent      = "concurrent"
+	peerRESTDuration        = "duration"
+	peerRESTStorageClass    = "storage-class"
+	peerRESTEnableSha256    = "enableSha256"
+	peerRESTEnableMultipart = "enableMultipart"
+	peerRESTAccessKey       = "access-key"
+	peerRESTMetricsTypes    = "types"
+	peerRESTDisk            = "disk"
+	peerRESTHost            = "host"
+	peerRESTJobID           = "job-id"
+	peerRESTDepID           = "depID"
+	peerRESTStartRebalance  = "start-rebalance"
+	peerRESTMetrics         = "metrics"
+	peerRESTDryRun          = "dry-run"
+	peerRESTUploadID        = "up-id"
 
 	peerRESTURL         = "url"
 	peerRESTSha256Sum   = "sha256sum"
 	peerRESTReleaseInfo = "releaseinfo"
+	peerRESTExecAt      = "exec-at"
 
 	peerRESTListenBucket = "bucket"
 	peerRESTListenPrefix = "prefix"
@@ -74,3 +80,5 @@ const (
 	peerRESTListenEvents = "events"
 	peerRESTLogMask      = "log-mask"
 )
+
+const restartUpdateDelay = 250 * time.Millisecond
